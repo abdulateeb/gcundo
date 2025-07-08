@@ -1,0 +1,25 @@
+{
+  "name": "gcundo",
+  "version": "1.0.",
+  "description": "undo/redo functionality for Gemini CLI",
+  "main": "cli.js",
+  "bin": {
+    "gcundo": "./cli.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["gemini", "cli", "undo", "redo"],
+  "author": "Abdul Ateeb",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/abdulateeb/gcundo.git"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "fs-extra": "^11.3.0",
+    "inquirer": "^12.7.0"
+  }
+}
