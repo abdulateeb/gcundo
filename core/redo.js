@@ -1,89 +1,104 @@
-const fs = require('fs-extra');
-const chalk = require('chalk');
-const path = require('path');
-const os = require('os');
-const { logPath } = require('./logger');
+const { updateOperationUndoState, UNDO_STATES } = require('./logger');
+const { 
+  getUndoneOperations, 
+  getOperationById, 
+  getActiveOperations 
+} = require('./sessions');
+const { performRedo } = require('./undo');
 
-// Cascading redo: re-apply the selected operation *and all operations after it*
-// For every operation re-applied we:
-// 1. Backup the current file (if it exists) to ~/.gcundo/backups/{id}-redo.bak
-// 2. Perform the appropriate filesystem action depending on op.type
-//    - file_edit   : write the `after` content
-//    - file_create : write the `after` content (or empty string if undefined)
-//    - file_delete : delete the file if it exists
-// 3. Skip unsupported types with a fallback message
-// 4. When finished log: "Cascading redo completed from index N."
-async function redoOperation(index) {
-  // Ensure log exists
-  if (!await fs.pathExists(logPath)) {
-    console.log(chalk.red('Error: No log file found.'));
-    return;
-  }
-
-  const lines = (await fs.readFile(logPath, 'utf-8'))
-    .split('\n')
-    .map(line => line.trim())
-    .filter(line => line.length > 0);
-
-  let ops;
-  try {
-    ops = lines.map(line => JSON.parse(line));
-  } catch (parseErr) {
-    console.log(chalk.red('Error: Malformed JSON in log file.'));
-    return;
-  }
-
-  // Validate index
-  if (index < 0 || index >= ops.length) {
-    console.log(chalk.red('Error: Invalid operation index.'));
-    return;
-  }
-
-  // Prepare backup directory once
-  const backupDir = path.join(os.homedir(), '.gcundo', 'backups');
-  await fs.ensureDir(backupDir);
-
-  // Iterate forward from selected index to the latest operation
-  for (let i = index; i < ops.length; i++) {
-    const op = ops[i];
-    const filePath = path.resolve(op.file);
-
-    // 1. Backup current state if the file exists
-    if (await fs.pathExists(filePath)) {
-      try {
-        await fs.copy(filePath, path.join(backupDir, `${op.id}-redo.bak`));
-      } catch (copyErr) {
-        console.log(chalk.red(`Error: Failed to backup ${op.file} - ${copyErr.message}`));
-      }
+// Redo operation by ID or index
+async function redoOperation(operationIdOrIndex) {
+  let operation;
+  
+  // Check if it's an operation ID (starts with 'op_') or an index
+  if (typeof operationIdOrIndex === 'string' && operationIdOrIndex.startsWith('op_')) {
+    // Operation ID
+    operation = getOperationById(operationIdOrIndex);
+    if (!operation) {
+      throw new Error(`Operation not found: ${operationIdOrIndex}`);
     }
-
-    // 2. Re-apply operation
-    try {
-      switch (op.type) {
-        case 'file_edit':
-          await fs.outputFile(filePath, op.after, 'utf-8');
-          console.log(`Re-applied changes to: ${op.file}`);
-          break;
-        case 'file_create':
-          await fs.outputFile(filePath, op.after || '', 'utf-8');
-          console.log(`Recreated file: ${op.file}`);
-          break;
-        case 'file_delete':
-          if (await fs.pathExists(filePath)) {
-            await fs.remove(filePath);
-            console.log(`Deleted file again: ${op.file}`);
-          }
-          break;
-        default:
-          console.log(`Redo not supported for operation type: ${op.type}.`);
-      }
-    } catch (fileErr) {
-      console.log(chalk.red(`Error: Failed to redo operation on ${op.file} - ${fileErr.message}`));
+  } else {
+    // Index (convert to 0-based)
+    const index = parseInt(operationIdOrIndex, 10);
+    if (isNaN(index)) {
+      throw new Error(`Invalid operation identifier: ${operationIdOrIndex}`);
     }
+    
+    const undoneOps = getUndoneOperations()
+      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    
+    if (index < 0 || index >= undoneOps.length) {
+      throw new Error(`Invalid operation index: ${index + 1}. Available: 1-${undoneOps.length}`);
+    }
+    
+    operation = undoneOps[index];
   }
 
-  // 3. Final log
-  console.log(`Cascading redo completed from index ${index}.`);
+  if (operation.undoState === UNDO_STATES.ACTIVE) {
+    throw new Error(`Operation ${operation.id} is already active`);
+  }
+
+  await performRedo(operation);
+  
+  return { redone: operation };
 }
 
-module.exports = { redoOperation };
+// Redo the last undone operation
+async function redoLast() {
+  const undoneOps = getUndoneOperations();
+  if (undoneOps.length === 0) {
+    throw new Error('No operations to redo');
+  }
+  
+  // Get the most recently undone operation
+  const lastUndone = undoneOps.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
+  return await redoOperation(lastUndone.id);
+}
+
+// Redo multiple operations by their IDs
+async function redoMultiple(operationIds) {
+  const results = [];
+  
+  for (const id of operationIds) {
+    try {
+      const result = await redoOperation(id);
+      results.push({ success: true, ...result });
+    } catch (error) {
+      results.push({ success: false, id, error: error.message });
+    }
+  }
+  
+  return results;
+}
+
+// Redo all undone operations (use with caution)
+async function redoAll() {
+  const undoneOps = getUndoneOperations()
+    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp)); // Redo in chronological order
+  
+  if (undoneOps.length === 0) {
+    throw new Error('No operations to redo');
+  }
+  
+  const results = [];
+  
+  for (const operation of undoneOps) {
+    try {
+      await performRedo(operation);
+      results.push({ success: true, redone: operation });
+    } catch (error) {
+      results.push({ success: false, operation: operation.id, error: error.message });
+      // Stop on first error to maintain consistency
+      break;
+    }
+  }
+  
+  return { redone: results.filter(r => r.success).length, results };
+}
+
+module.exports = {
+  redoOperation,
+  redoLast,
+  redoMultiple,
+  redoAll
+};
